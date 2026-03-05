@@ -127,23 +127,47 @@ Tier rules:
 
 Only include jobs with real URLs that you actually found. Return [] if nothing found today."""
 
-    try:
-        resp = requests.post(
+    def _call_claude(use_web_search: bool) -> requests.Response:
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4000,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if use_web_search:
+            body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        return requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 4000,
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            json=body,
             timeout=120,
         )
-        resp.raise_for_status()
+
+    try:
+        # Try with web search first; fall back to plain Claude if tool not available
+        resp = _call_claude(use_web_search=True)
+        if resp.status_code == 400:
+            err = resp.json().get("error", {})
+            log.warning(f"Web search tool error ({err.get('type')}): {err.get('message')} — retrying without web search")
+            resp = _call_claude(use_web_search=False)
+
+        if resp.status_code != 200:
+            err_body = resp.text
+            try:
+                err_body = resp.json().get("error", {}).get("message", resp.text)
+            except Exception:
+                pass
+            log.error(f"Anthropic API error {resp.status_code}: {err_body}")
+            if resp.status_code == 401:
+                log.error("👉 Fix: ANTHROPIC_API_KEY is invalid or missing in Railway Variables")
+            elif resp.status_code == 403:
+                log.error("👉 Fix: Check your Anthropic account has API access and billing set up at console.anthropic.com")
+            elif resp.status_code == 429:
+                log.error("👉 Fix: Anthropic rate limit hit — will retry next cycle")
+            return []
         data = resp.json()
 
         # Extract final text block (comes after tool_use blocks)
