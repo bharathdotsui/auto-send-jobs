@@ -91,41 +91,45 @@ def find_and_score_jobs() -> list[dict]:
     then score each one against Bharath's resume. Returns structured list.
     """
     today = datetime.now().strftime('%B %d, %Y')
-    prompt = f"""Today is {today}.
+    prompt = f"""Today is {today}. You MUST use the web_search tool multiple times to find real job postings.
 
-Search the web for ServiceNow jobs posted in the last 24 hours on Dice, LinkedIn, and Indeed.
-Run these searches:
-1. "ServiceNow Developer jobs posted today" site:dice.com
-2. "ServiceNow ITOM CMDB developer job" posted today
-3. "ServiceNow IRM GRC Vulnerability Response job" new posting today
+Do NOT skip the searches. Do NOT return [] without searching first.
 
-For every real job posting you find, evaluate it against this candidate profile:
+Run ALL of these searches right now using your web_search tool:
+1. Search for: ServiceNow Developer jobs {today}
+2. Search for: ServiceNow Developer contract remote jobs 2026
+3. Search for: ServiceNow ITOM Discovery CMDB jobs hiring now
+4. Search for: ServiceNow IRM GRC developer jobs
+5. Search for: ServiceNow Vulnerability Response SecOps jobs
 
+After searching, collect every real job posting URL you find from dice.com, indeed.com, linkedin.com, ziprecruiter.com, glassdoor.com, or any job board.
+
+Then evaluate each job against this candidate profile:
 {RESUME_SUMMARY}
 
-Respond ONLY with a valid JSON array. No markdown fences, no explanation, just the JSON:
+Return ONLY a raw JSON array (no markdown, no code fences, no explanation):
 [
   {{
-    "title": "Job title",
+    "title": "Exact job title",
     "company": "Company name",
     "location": "City, State or Remote",
     "salary": "$XX/hr or $XXXk/yr or Not listed",
     "job_type": "Contract or Full-time",
-    "url": "Direct job posting URL",
+    "url": "Full job posting URL",
     "score": 85,
     "tier": "Tier 1",
-    "match_reason": "1-2 sentences explaining the match to Bharath's specific skills",
+    "match_reason": "Why this matches Bharath's ITOM/CMDB/IRM/SecOps skills specifically",
     "requires_clearance": false
   }}
 ]
 
-Tier rules:
-- Tier 1 (score 80-100): Near-perfect match
-- Tier 2 (score 60-79): Strong match
-- Tier 3 (score 40-59): Good match
-- EXCLUDE: anything below 40, anything requiring security clearance or US citizenship
+Scoring:
+- Tier 1 (80-100): Near-perfect match
+- Tier 2 (60-79): Strong match
+- Tier 3 (40-59): Good match
+- Skip jobs below score 40 or requiring clearance/citizenship
 
-Only include jobs with real URLs that you actually found. Return [] if nothing found today."""
+You MUST search first before responding. Include every job you find that scores 40+."""
 
     def _call_claude(use_web_search: bool) -> requests.Response:
         body = {
@@ -135,6 +139,7 @@ Only include jobs with real URLs that you actually found. Return [] if nothing f
         }
         if use_web_search:
             body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+            body["tool_choice"] = {"type": "auto"}  # Claude decides when to search
         return requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -172,13 +177,21 @@ Only include jobs with real URLs that you actually found. Return [] if nothing f
 
         # Extract final text block (comes after tool_use blocks)
         full_text = ""
+        tool_uses = 0
         for block in data.get("content", []):
             if block.get("type") == "text":
                 full_text += block.get("text", "")
+            elif block.get("type") == "tool_use":
+                tool_uses += 1
+
+        log.info(f"Claude used web_search {tool_uses} time(s)")
 
         if not full_text.strip():
             log.warning("Claude returned no text — possibly only tool_use blocks")
+            log.warning(f"Full response content types: {[b.get('type') for b in data.get('content', [])]}")
             return []
+
+        log.info(f"Claude raw response (first 300 chars): {full_text[:300]}")
 
         # Find JSON array in response
         text  = full_text.strip()
