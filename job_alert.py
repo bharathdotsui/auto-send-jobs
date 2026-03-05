@@ -10,6 +10,7 @@ import time
 import hashlib
 import logging
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from anthropic import Anthropic
 
@@ -76,35 +77,100 @@ Location: Atlanta, GA (Alpharetta area)
 Education: MS Information Technology – St. Francis; B.Tech Electronics – JNTU Hyderabad
 """
 
-# ─── Dice API ─────────────────────────────────────────────────────────────────
-DICE_API_URL = "https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search"
-DICE_SEARCH_PARAMS = {
-    "q": "ServiceNow Developer",
-    "countryCode2": "US",
-    "pageSize": 50,
-    "posted": "ONE",   # last 24 hours
-    "sort": "date",
-}
-DICE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-    "x-api-key": "1YAt0R9wBg4WfsF9VB6ol.lHZlFBVlGxoLfnBJF_mZHm",
+# ─── Job Sources (RSS feeds — no API key needed, no IP blocking) ──────────────
+# We pull from multiple sources so you never miss a role.
+RSS_FEEDS = [
+    # Indeed RSS — most reliable, no auth needed
+    {
+        "name": "Indeed",
+        "url": (
+            "https://www.indeed.com/rss?q=ServiceNow+Developer&l=United+States"
+            "&sort=date&fromage=1&limit=50"
+        ),
+    },
+    # Indeed — ITOM/CMDB specialist search
+    {
+        "name": "Indeed-ITOM",
+        "url": (
+            "https://www.indeed.com/rss?q=ServiceNow+ITOM+CMDB&l=United+States"
+            "&sort=date&fromage=1&limit=25"
+        ),
+    },
+    # Indeed — IRM/GRC/SecOps search
+    {
+        "name": "Indeed-SecOps",
+        "url": (
+            "https://www.indeed.com/rss?q=ServiceNow+IRM+GRC+SecOps&l=United+States"
+            "&sort=date&fromage=1&limit=25"
+        ),
+    },
+]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 
-def fetch_dice_jobs() -> list[dict]:
-    """Fetch latest ServiceNow jobs from Dice posted in last 24 hours."""
-    try:
-        resp = requests.get(DICE_API_URL, params=DICE_SEARCH_PARAMS,
-                            headers=DICE_HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        jobs = data.get("data", [])
-        log.info(f"Fetched {len(jobs)} jobs from Dice")
-        return jobs
-    except Exception as e:
-        log.error(f"Failed to fetch Dice jobs: {e}")
-        return []
+def fetch_rss_jobs() -> list[dict]:
+    """Fetch jobs from Indeed RSS feeds — reliable, no IP blocking."""
+    all_jobs = []
+    seen_titles = set()
+
+    for feed in RSS_FEEDS:
+        try:
+            resp = requests.get(feed["url"], headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+
+            root = ET.fromstring(resp.content)
+            ns = ""
+            items = root.findall(".//item")
+
+            for item in items:
+                title   = (item.findtext("title") or "").strip()
+                link    = (item.findtext("link") or "").strip()
+                company = (item.findtext("source") or "").strip()
+                summary = (item.findtext("description") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                location = ""
+
+                # Indeed puts location in title like "ServiceNow Developer - Atlanta, GA"
+                if " - " in title:
+                    parts    = title.rsplit(" - ", 1)
+                    title    = parts[0].strip()
+                    location = parts[1].strip()
+
+                # Deduplicate by title+company
+                key = f"{title.lower()}|{company.lower()}"
+                if key in seen_titles:
+                    continue
+                seen_titles.add(key)
+
+                all_jobs.append({
+                    "guid":        link,
+                    "title":       title,
+                    "companyName": company,
+                    "jobLocation": {"displayName": location} if location else None,
+                    "summary":     summary[:500],
+                    "salary":      "See posting",
+                    "detailsPageUrl": link,
+                    "workplaceTypes": [],
+                    "employmentType": "See posting",
+                    "postedDate":  pub_date,
+                    "source":      feed["name"],
+                })
+
+            log.info(f"  [{feed['name']}] fetched {len(items)} jobs")
+
+        except Exception as e:
+            log.error(f"  [{feed['name']}] RSS fetch failed: {e}")
+
+    log.info(f"Total jobs fetched across all feeds: {len(all_jobs)}")
+    return all_jobs
 
 
 # ─── Seen Jobs Tracking ────────────────────────────────────────────────────────
@@ -243,7 +309,7 @@ def send_email(jobs: list[dict]):
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;">
       <div style="background:#1a73e8;padding:20px;border-radius:8px 8px 0 0;">
-        <h2 style="color:white;margin:0;">🔔 New ServiceNow Job Matches on Dice</h2>
+        <h2 style="color:white;margin:0;">🔔 New ServiceNow Job Matches Found</h2>
         <p style="color:#dde;margin:4px 0 0;">{datetime.now().strftime('%B %d, %Y at %I:%M %p')}</p>
       </div>
       <div style="background:#f9f9f9;padding:16px;border-radius:0 0 8px 8px;">
@@ -252,7 +318,7 @@ def send_email(jobs: list[dict]):
           {rows}
         </table>
         <p style="color:#999;font-size:12px;margin-top:16px;">
-          Auto-generated by your ServiceNow Job Alert · Powered by Claude AI + Dice
+          Auto-generated by your ServiceNow Job Alert · Powered by Claude AI + Indeed RSS
         </p>
       </div>
     </body></html>"""
@@ -260,7 +326,7 @@ def send_email(jobs: list[dict]):
     payload = {
         "personalizations": [{"to": [{"email": ALERT_TO_EMAIL}]}],
         "from": {"email": ALERT_FROM_EMAIL, "name": "ServiceNow Job Alert"},
-        "subject": f"🔔 {len(jobs)} New ServiceNow Job Match{'es' if len(jobs)>1 else ''} on Dice",
+        "subject": f"🔔 {len(jobs)} New ServiceNow Job Match{'es' if len(jobs)>1 else ''} Found",
         "content": [{"type": "text/html", "value": html}],
     }
 
@@ -283,7 +349,7 @@ def send_email(jobs: list[dict]):
 def send_sms(jobs: list[dict]):
     """Send a concise SMS summary via Twilio."""
     tier_emoji = {"Tier 1": "🏆", "Tier 2": "🥈", "Tier 3": "🥉"}
-    lines = [f"🔔 {len(jobs)} new ServiceNow job match{'es' if len(jobs)>1 else ''} on Dice!\n"]
+    lines = [f"🔔 {len(jobs)} new ServiceNow job match{'es' if len(jobs)>1 else ''} found!\n"]
 
     for job in jobs[:5]:   # SMS cap at 5 to keep it readable
         emoji = tier_emoji.get(job["ai_tier"], "📌")
@@ -319,13 +385,13 @@ def send_sms(jobs: list[dict]):
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 def run():
-    log.info("🚀 ServiceNow Job Alert started — checking every hour")
+    log.info("🚀 ServiceNow Job Alert started — checking Indeed RSS every hour")
     seen_jobs = load_seen_jobs()
 
     while True:
-        log.info(f"🔍 Checking Dice for new ServiceNow jobs...")
+        log.info(f"🔍 Checking Indeed RSS feeds for new ServiceNow jobs...")
 
-        jobs       = fetch_dice_jobs()
+        jobs       = fetch_rss_jobs()
         new_jobs   = [j for j in jobs if job_id(j) not in seen_jobs]
         log.info(f"Found {len(new_jobs)} new (unseen) jobs out of {len(jobs)} total")
 
